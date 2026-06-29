@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# App/runtime
+*.log
+_WAV_BACKUP_AFTER_AIFF/
