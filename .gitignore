@@ -18,3 +18,10 @@ dist/
 dmg_root/
 build_assets/
 *.spec
+
+# PyInstaller / macOS packaging artifacts
+build/
+dist/
+dmg_root/
+build_assets/
+*.spec
