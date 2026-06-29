@@ -1,0 +1,13 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/.venv/lib/python3.11/site-packages"
+  ],
+  "cSpell.words": [
+    "AIFF",
+    "aiff",
+    "ffmpeg",
+    "imageio",
+    "subfolders"
+  ]
+}
