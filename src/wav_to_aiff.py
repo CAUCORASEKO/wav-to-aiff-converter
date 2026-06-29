@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Iterable
 import argparse
+import re
 import shutil
 import subprocess
 import traceback
@@ -12,9 +13,23 @@ try:
 except ImportError:
     get_ffmpeg_exe = None
 
+try:
+    from send2trash import send2trash
+except ImportError:
+    send2trash = None
 
-SUPPORTED_WAV_SUFFIXES = {".wav", ".wave"}
+try:
+    from mutagen import File as mutagen_file
+except ImportError:
+    mutagen_file = None
+
+
+WAV_SUFFIXES = {".wav", ".wave"}
+AIFF_SUFFIXES = {".aiff", ".aif"}
+ORGANIZABLE_SUFFIXES = {".aiff", ".aif", ".flac", ".mp3"}
+UNKNOWN_GENRE = "Unknown Genre"
 BACKUP_DIR_NAME = "_WAV_BACKUP_AFTER_AIFF"
+IGNORABLE_EMPTY_DIR_FILES = {".DS_Store", "Thumbs.db", "desktop.ini", "Icon\r"}
 
 
 def get_ffmpeg_command() -> Optional[str]:
@@ -75,11 +90,18 @@ def validate_audio_file(ffmpeg_cmd: str, path: Path) -> bool:
     return result.returncode == 0
 
 
+def move_to_trash(path: Path) -> None:
+    if send2trash is None:
+        raise RuntimeError("send2trash is not installed. Run: pip install -r requirements.txt")
+
+    send2trash(str(path))
+
+
 def path_is_inside_backup(path: Path) -> bool:
     return BACKUP_DIR_NAME in path.parts
 
 
-def find_wav_files(folder: Path, recursive: bool) -> List[Path]:
+def find_files(folder: Path, suffixes: set[str], recursive: bool) -> List[Path]:
     if recursive:
         files = [p for p in folder.rglob("*") if p.is_file()]
     else:
@@ -87,114 +109,354 @@ def find_wav_files(folder: Path, recursive: bool) -> List[Path]:
 
     return sorted(
         p for p in files
-        if p.suffix.lower() in SUPPORTED_WAV_SUFFIXES
+        if p.suffix.lower() in suffixes
         and not path_is_inside_backup(p)
     )
 
 
-def move_to_backup(wav_path: Path) -> Path:
-    backup_dir = wav_path.parent / BACKUP_DIR_NAME
-    backup_dir.mkdir(exist_ok=True)
-
-    backup_target = backup_dir / wav_path.name
+def unique_path(target: Path) -> Path:
+    if not target.exists():
+        return target
 
     counter = 1
-    while backup_target.exists():
-        backup_target = backup_dir / f"{wav_path.stem}_{counter}{wav_path.suffix}"
+    while True:
+        candidate = target.parent / f"{target.stem}_{counter}{target.suffix}"
+        if not candidate.exists():
+            return candidate
         counter += 1
 
-    shutil.move(str(wav_path), str(backup_target))
-    return backup_target
+
+def flatten_metadata_value(value) -> List[str]:
+    if value is None:
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        items = []
+        for item in value:
+            items.extend(flatten_metadata_value(item))
+        return items
+
+    if hasattr(value, "text"):
+        return flatten_metadata_value(value.text)
+
+    return [str(value)]
 
 
-def finalize_wav_after_valid_aiff(
-    wav_path: Path,
-    backup_wav: bool,
-    delete_wav: bool,
-) -> None:
-    if backup_wav:
-        backup_target = move_to_backup(wav_path)
-        print(f"BACKUP: WAV moved to {backup_target}")
-    elif delete_wav:
-        wav_path.unlink()
-        print("DELETE: WAV removed.")
-    else:
-        print("KEEP: WAV kept. Use --backup-wav or --delete-wav when ready.")
+def clean_genre_name(raw_genre: str) -> str:
+    genre = raw_genre.strip()
+
+    if not genre:
+        return UNKNOWN_GENRE
+
+    genre = re.split(r"[;/|]", genre)[0].strip()
+    genre = re.sub(r'[\\/:*?"<>|]', "-", genre)
+    genre = re.sub(r"\s+", " ", genre).strip()
+
+    if not genre:
+        return UNKNOWN_GENRE
+
+    return genre[:80]
 
 
-def convert_one_file(
+def get_audio_genre(path: Path) -> str:
+    if mutagen_file is None:
+        return UNKNOWN_GENRE
+
+    candidates: List[str] = []
+
+    try:
+        easy_audio = mutagen_file(path, easy=True)
+        if easy_audio is not None and easy_audio.tags:
+            for key in ("genre", "GENRE"):
+                if key in easy_audio.tags:
+                    candidates.extend(flatten_metadata_value(easy_audio.tags.get(key)))
+    except Exception:
+        pass
+
+    try:
+        audio = mutagen_file(path)
+        if audio is not None and audio.tags:
+            for key in ("genre", "GENRE", "TCON", "\xa9gen"):
+                value = audio.tags.get(key)
+                candidates.extend(flatten_metadata_value(value))
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        genre = clean_genre_name(candidate)
+        if genre != UNKNOWN_GENRE:
+            return genre
+
+    return UNKNOWN_GENRE
+
+
+def get_mp3_bitrate_kbps(path: Path) -> Optional[int]:
+    if mutagen_file is None:
+        return None
+
+    try:
+        audio = mutagen_file(path)
+        if audio is None or audio.info is None:
+            return None
+
+        bitrate = getattr(audio.info, "bitrate", None)
+
+        if bitrate is None:
+            return None
+
+        return round(int(bitrate) / 1000)
+
+    except Exception:
+        return None
+
+
+def convert_wavs_to_aiff(
+    folder: Path,
     ffmpeg_cmd: str,
-    wav_path: Path,
-    delete_wav: bool,
-    backup_wav: bool,
+    recursive: bool,
     dry_run: bool,
     overwrite: bool,
-) -> bool:
-    aiff_path = wav_path.with_suffix(".aiff")
+    trash_source_wav: bool,
+) -> tuple[int, int]:
+    wav_files = find_files(folder, WAV_SUFFIXES, recursive)
 
     print("")
-    print(f"WAV : {wav_path}")
-    print(f"AIFF: {aiff_path}")
+    print(f"WAV files found: {len(wav_files)}")
 
-    if aiff_path.exists() and not overwrite:
-        if validate_audio_file(ffmpeg_cmd, aiff_path):
-            print("SKIP CONVERSION: AIFF already exists and is valid.")
+    successful = 0
+    failed = 0
+
+    for wav_path in wav_files:
+        try:
+            aiff_path = wav_path.with_suffix(".aiff")
+
+            print("")
+            print(f"WAV : {wav_path}")
+            print(f"AIFF: {aiff_path}")
+
+            if aiff_path.exists() and not overwrite:
+                if validate_audio_file(ffmpeg_cmd, aiff_path):
+                    print("SKIP CONVERSION: AIFF already exists and is valid.")
+
+                    if trash_source_wav:
+                        if dry_run:
+                            print("DRY RUN: WAV would be moved to Trash.")
+                        else:
+                            move_to_trash(wav_path)
+                            print("TRASH: WAV moved to macOS Trash.")
+
+                    successful += 1
+                    continue
+
+                print("ERROR: Existing AIFF does not validate. Use --overwrite to recreate it.")
+                failed += 1
+                continue
+
             if dry_run:
-                print("DRY RUN: WAV would be finalized according to selected option.")
+                print("DRY RUN: WAV would be converted to AIFF.")
+                if trash_source_wav:
+                    print("DRY RUN: WAV would be moved to Trash after AIFF validation.")
+                successful += 1
+                continue
+
+            result = run_ffmpeg(ffmpeg_cmd, wav_path, aiff_path)
+
+            if result.returncode != 0:
+                print("ERROR: FFmpeg conversion failed.")
+                print(result.stderr)
+                failed += 1
+                continue
+
+            if not validate_audio_file(ffmpeg_cmd, aiff_path):
+                print("ERROR: AIFF output did not validate. WAV was kept.")
+                failed += 1
+                continue
+
+            print("OK: AIFF created and verified.")
+
+            if trash_source_wav:
+                move_to_trash(wav_path)
+                print("TRASH: WAV moved to macOS Trash.")
+
+            successful += 1
+
+        except Exception:
+            failed += 1
+            print("")
+            print(f"UNEXPECTED ERROR while processing WAV: {wav_path}")
+            print(traceback.format_exc())
+
+    return successful, failed
+
+
+def trash_low_quality_mp3(
+    folder: Path,
+    recursive: bool,
+    dry_run: bool,
+    min_bitrate_kbps: int,
+) -> tuple[int, int]:
+    mp3_files = find_files(folder, {".mp3"}, recursive)
+
+    print("")
+    print(f"MP3 files found: {len(mp3_files)}")
+    print(f"Minimum MP3 bitrate: {min_bitrate_kbps} kbps")
+
+    trashed = 0
+    kept = 0
+
+    for mp3_path in mp3_files:
+        bitrate = get_mp3_bitrate_kbps(mp3_path)
+
+        if bitrate is None:
+            print(f"KEEP: bitrate unknown -> {mp3_path}")
+            kept += 1
+            continue
+
+        if bitrate < min_bitrate_kbps:
+            print(f"LOW QUALITY MP3: {bitrate} kbps -> {mp3_path}")
+
+            if dry_run:
+                print("DRY RUN: MP3 would be moved to Trash.")
             else:
-                finalize_wav_after_valid_aiff(
-                    wav_path=wav_path,
-                    backup_wav=backup_wav,
-                    delete_wav=delete_wav,
-                )
-            return True
+                move_to_trash(mp3_path)
+                print("TRASH: MP3 moved to macOS Trash.")
 
-        print("ERROR: AIFF already exists but does not validate. Use --overwrite to recreate it.")
-        return False
+            trashed += 1
+        else:
+            print(f"KEEP: {bitrate} kbps -> {mp3_path}")
+            kept += 1
 
-    if dry_run:
-        print("DRY RUN: No conversion performed.")
-        return True
+    return trashed, kept
 
-    result = run_ffmpeg(ffmpeg_cmd, wav_path, aiff_path)
 
-    if result.returncode != 0:
-        print("ERROR: FFmpeg conversion failed.")
-        print(result.stderr)
-        return False
+def organize_by_genre(
+    folder: Path,
+    recursive: bool,
+    dry_run: bool,
+) -> tuple[int, int]:
+    audio_files = find_files(folder, ORGANIZABLE_SUFFIXES, recursive)
 
-    if not validate_audio_file(ffmpeg_cmd, aiff_path):
-        print("ERROR: AIFF output was not created correctly. WAV was kept.")
-        return False
+    print("")
+    print(f"Organizable audio files found: {len(audio_files)}")
 
-    print("OK: AIFF created and verified.")
+    moved = 0
+    skipped = 0
 
-    finalize_wav_after_valid_aiff(
-        wav_path=wav_path,
-        backup_wav=backup_wav,
-        delete_wav=delete_wav,
+    for audio_path in audio_files:
+        try:
+            if not audio_path.exists():
+                skipped += 1
+                continue
+
+            genre = get_audio_genre(audio_path)
+            genre_folder = folder / genre
+            target_path = unique_path(genre_folder / audio_path.name)
+
+            if audio_path.resolve() == target_path.resolve():
+                print(f"SKIP: already in correct genre folder -> {audio_path}")
+                skipped += 1
+                continue
+
+            print("")
+            print(f"TRACK: {audio_path}")
+            print(f"GENRE: {genre}")
+            print(f"MOVE : {target_path}")
+
+            if dry_run:
+                print("DRY RUN: Track would be moved.")
+                moved += 1
+                continue
+
+            genre_folder.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(audio_path), str(target_path))
+            print("OK: Track moved.")
+            moved += 1
+
+        except Exception:
+            skipped += 1
+            print("")
+            print(f"UNEXPECTED ERROR while organizing: {audio_path}")
+            print(traceback.format_exc())
+
+    return moved, skipped
+
+
+def is_ignorable_empty_dir_item(path: Path) -> bool:
+    return path.is_file() and path.name in IGNORABLE_EMPTY_DIR_FILES
+
+
+def remove_empty_folders(folder: Path, dry_run: bool) -> int:
+    removed = 0
+
+    folders = sorted(
+        [p for p in folder.rglob("*") if p.is_dir()],
+        key=lambda p: len(p.parts),
+        reverse=True,
     )
 
-    return True
+    for current_folder in folders:
+        if current_folder == folder:
+            continue
+
+        try:
+            contents = list(current_folder.iterdir())
+        except Exception:
+            continue
+
+        ignored_items = [
+            item for item in contents
+            if is_ignorable_empty_dir_item(item)
+        ]
+
+        real_items = [
+            item for item in contents
+            if item not in ignored_items
+        ]
+
+        if real_items:
+            continue
+
+        print(f"EMPTY OR JUNK-ONLY FOLDER: {current_folder}")
+
+        if ignored_items:
+            for item in ignored_items:
+                print(f"JUNK FILE: {item}")
+
+        if dry_run:
+            print("DRY RUN: Junk files and folder would be removed.")
+            removed += 1
+            continue
+
+        for item in ignored_items:
+            try:
+                item.unlink()
+                print(f"REMOVE JUNK: {item}")
+            except Exception as exc:
+                print(f"SKIP JUNK: could not remove {item} ({exc})")
+
+        try:
+            current_folder.rmdir()
+            print("REMOVE: Empty folder removed.")
+            removed += 1
+        except Exception as exc:
+            print(f"SKIP: folder could not be removed: {current_folder} ({exc})")
+
+    return removed
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Batch convert WAV audio files to AIFF safely."
+        description="Convert WAV to AIFF, remove low-quality MP3, organize music by genre, and clean empty folders."
     )
 
-    parser.add_argument("folder", help="Folder containing WAV files.")
+    parser.add_argument("folder", help="Music folder to process.")
     parser.add_argument("--recursive", action="store_true", help="Search inside subfolders.")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be converted without changing files.")
-    parser.add_argument("--backup-wav", action="store_true", help="Move WAV files to backup after successful conversion.")
-    parser.add_argument("--delete-wav", action="store_true", help="Delete WAV files after successful conversion.")
+    parser.add_argument("--dry-run", action="store_true", help="Show actions without changing files.")
+    parser.add_argument("--clean-library", action="store_true", help="Run the full cleaning pipeline.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing AIFF files.")
+    parser.add_argument("--min-mp3-bitrate", type=int, default=320, help="Minimum MP3 bitrate in kbps.")
 
     args = parser.parse_args()
-
-    if args.backup_wav and args.delete_wav:
-        print("ERROR: Use only one option: --backup-wav or --delete-wav.")
-        return 1
 
     folder = Path(args.folder).expanduser().resolve()
 
@@ -202,56 +464,77 @@ def main() -> int:
         print(f"ERROR: Folder does not exist: {folder}")
         return 1
 
+    if send2trash is None:
+        print("ERROR: send2trash is not installed.")
+        print("Run: pip install -r requirements.txt")
+        return 1
+
+    if mutagen_file is None:
+        print("ERROR: mutagen is not installed.")
+        print("Run: pip install -r requirements.txt")
+        return 1
+
     ffmpeg_cmd = get_ffmpeg_command()
 
     if not ffmpeg_cmd:
         print("ERROR: FFmpeg is not available.")
-        print("Run:")
-        print("  pip install -r requirements.txt")
+        print("Run: pip install -r requirements.txt")
         return 1
 
     print(f"FFmpeg: {ffmpeg_cmd}")
-
-    wav_files = find_wav_files(folder, args.recursive)
-
     print(f"Folder: {folder}")
     print(f"Recursive: {args.recursive}")
-    print(f"WAV files found outside backup folders: {len(wav_files)}")
+    print(f"Dry run: {args.dry_run}")
 
-    if not wav_files:
+    if not args.clean_library:
+        print("")
+        print("No action selected.")
+        print("Use:")
+        print('  python src/wav_to_aiff.py "$HOME/Desktop/complete" --recursive --clean-library --dry-run')
         return 0
 
-    successful = 0
-    failed = 0
+    total_failed = 0
 
-    for wav_path in wav_files:
-        try:
-            ok = convert_one_file(
-                ffmpeg_cmd=ffmpeg_cmd,
-                wav_path=wav_path,
-                delete_wav=args.delete_wav,
-                backup_wav=args.backup_wav,
-                dry_run=args.dry_run,
-                overwrite=args.overwrite,
-            )
+    wav_ok, wav_failed = convert_wavs_to_aiff(
+        folder=folder,
+        ffmpeg_cmd=ffmpeg_cmd,
+        recursive=args.recursive,
+        dry_run=args.dry_run,
+        overwrite=args.overwrite,
+        trash_source_wav=True,
+    )
 
-            if ok:
-                successful += 1
-            else:
-                failed += 1
+    total_failed += wav_failed
 
-        except Exception:
-            failed += 1
-            print("")
-            print(f"UNEXPECTED ERROR while processing: {wav_path}")
-            print(traceback.format_exc())
+    mp3_trashed, mp3_kept = trash_low_quality_mp3(
+        folder=folder,
+        recursive=args.recursive,
+        dry_run=args.dry_run,
+        min_bitrate_kbps=args.min_mp3_bitrate,
+    )
+
+    moved, skipped = organize_by_genre(
+        folder=folder,
+        recursive=args.recursive,
+        dry_run=args.dry_run,
+    )
+
+    removed_folders = remove_empty_folders(
+        folder=folder,
+        dry_run=args.dry_run,
+    )
 
     print("")
-    print("Done.")
-    print(f"Successful items: {successful}")
-    print(f"Failed items: {failed}")
+    print("Library cleaning finished.")
+    print(f"WAV converted/handled: {wav_ok}")
+    print(f"WAV failed: {wav_failed}")
+    print(f"Low-quality MP3 trashed/planned: {mp3_trashed}")
+    print(f"MP3 kept: {mp3_kept}")
+    print(f"Tracks moved/planned by genre: {moved}")
+    print(f"Tracks skipped: {skipped}")
+    print(f"Empty folders removed/planned: {removed_folders}")
 
-    return 0 if failed == 0 else 2
+    return 0 if total_failed == 0 else 2
 
 
 if __name__ == "__main__":
