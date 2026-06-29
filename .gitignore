@@ -11,3 +11,10 @@ env/
 # App/runtime
 *.log
 _WAV_BACKUP_AFTER_AIFF/
+
+# PyInstaller / macOS packaging artifacts
+build/
+dist/
+dmg_root/
+build_assets/
+*.spec
