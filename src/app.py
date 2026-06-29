@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 import queue
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -36,6 +38,100 @@ def resource_path(relative_path: str) -> Path:
         return Path(sys._MEIPASS) / relative_path
 
     return Path(__file__).resolve().parents[1] / relative_path
+
+
+def clean_raw_path(raw_path: str) -> str:
+    path = raw_path.strip()
+
+    if path.startswith("file://"):
+        parsed = urlparse(path)
+        path = unquote(parsed.path)
+
+    if path.startswith("{") and path.endswith("}"):
+        path = path[1:-1]
+
+    return path.strip()
+
+
+def desktop_candidates_for(path: Path) -> list[Path]:
+    candidates = [path]
+
+    name = path.name
+
+    if not name:
+        return candidates
+
+    local_desktop = Path.home() / "Desktop"
+    icloud_desktop = Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "Desktop"
+
+    candidates.append(local_desktop / name)
+    candidates.append(icloud_desktop / name)
+
+    path_parts = path.parts
+
+    try:
+        local_index = path_parts.index("Desktop")
+        relative_after_desktop = Path(*path_parts[local_index + 1:])
+        if str(relative_after_desktop) != ".":
+            candidates.append(icloud_desktop / relative_after_desktop)
+    except ValueError:
+        pass
+
+    return candidates
+
+
+def resolve_selected_folder(raw_path: str) -> Path:
+    cleaned = clean_raw_path(raw_path)
+    selected = Path(cleaned).expanduser()
+
+    candidates = desktop_candidates_for(selected)
+
+    seen = set()
+    for candidate in candidates:
+        candidate_key = str(candidate)
+        if candidate_key in seen:
+            continue
+
+        seen.add(candidate_key)
+
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+
+    return selected
+
+
+def choose_folder_with_macos_dialog() -> str | None:
+    if sys.platform != "darwin":
+        return None
+
+    script = '''
+    try
+        set chosenFolder to choose folder with prompt "Choose music folder"
+        POSIX path of chosenFolder
+    on error
+        return ""
+    end try
+    '''
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        folder = result.stdout.strip()
+
+        if folder:
+            return folder.rstrip("/")
+
+    except Exception:
+        return None
+
+    return None
 
 
 class StdoutRedirector:
@@ -179,9 +275,15 @@ class MusicCleanerApp:
         self.root.after(100, self.poll_log_queue)
 
     def choose_folder(self):
-        folder = filedialog.askdirectory(title="Choose music folder")
+        folder = choose_folder_with_macos_dialog()
+
+        if folder is None:
+            folder = filedialog.askdirectory(title="Choose music folder")
+
         if folder:
-            self.selected_folder.set(folder)
+            resolved_folder = resolve_selected_folder(folder)
+            self.selected_folder.set(str(resolved_folder))
+            self.log(f"\nSelected folder: {resolved_folder}\n")
 
     def on_drop(self, event):
         try:
@@ -190,29 +292,68 @@ class MusicCleanerApp:
             if not paths:
                 return
 
-            folder = Path(paths[0])
+            folder = resolve_selected_folder(paths[0])
 
             if folder.is_file():
                 folder = folder.parent
 
             self.selected_folder.set(str(folder))
+            self.log(f"\nDropped folder: {folder}\n")
+
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"Could not read dropped folder:\n{exc}")
+
+    def validate_selected_folder(self) -> Path | None:
+        folder_text = self.selected_folder.get().strip()
+
+        if not folder_text:
+            messagebox.showwarning(APP_NAME, "Please choose or drop a music folder first.")
+            return None
+
+        folder = resolve_selected_folder(folder_text)
+
+        if not folder.exists():
+            messagebox.showerror(
+                APP_NAME,
+                "Folder does not exist or macOS returned a path that cannot be accessed:\n\n"
+                f"{folder}\n\n"
+                "Try selecting it again with Choose Folder. If it is in iCloud Desktop, "
+                "make sure it is downloaded locally."
+            )
+            return None
+
+        if not folder.is_dir():
+            messagebox.showerror(APP_NAME, f"Selected path is not a folder:\n\n{folder}")
+            return None
+
+        try:
+            list(folder.iterdir())
+        except PermissionError:
+            messagebox.showerror(
+                APP_NAME,
+                "The folder exists, but macOS blocked access:\n\n"
+                f"{folder}\n\n"
+                "Go to System Settings → Privacy & Security → Full Disk Access "
+                "and add Music Genre Cleaner.app."
+            )
+            return None
+        except Exception as exc:
+            messagebox.showerror(
+                APP_NAME,
+                f"Could not read selected folder:\n\n{folder}\n\nError:\n{exc}"
+            )
+            return None
+
+        self.selected_folder.set(str(folder))
+        return folder
 
     def start_cleaning(self):
         if self.is_running:
             return
 
-        folder_text = self.selected_folder.get().strip()
+        folder = self.validate_selected_folder()
 
-        if not folder_text:
-            messagebox.showwarning(APP_NAME, "Please choose or drop a music folder first.")
-            return
-
-        folder = Path(folder_text).expanduser().resolve()
-
-        if not folder.exists() or not folder.is_dir():
-            messagebox.showerror(APP_NAME, f"Invalid folder:\n{folder}")
+        if folder is None:
             return
 
         answer = messagebox.askyesno(
@@ -301,10 +442,11 @@ class MusicCleanerApp:
             )
 
         except Exception as exc:
-            print(f"\nERROR: {exc}")
+            message = str(exc)
+            print(f"\nERROR: {message}")
             self.root.after(
                 0,
-                lambda: messagebox.showerror(APP_NAME, f"Error:\n{exc}"),
+                lambda message=message: messagebox.showerror(APP_NAME, f"Error:\n{message}"),
             )
 
         finally:
