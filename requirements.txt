@@ -1,1 +1,6 @@
 imageio-ffmpeg>=0.6.0
+send2trash>=1.8.3
+mutagen>=1.47.0
+tkinterdnd2>=0.4.2
+pyinstaller>=6.0
+pillow>=10.0.0
